@@ -1,0 +1,54 @@
+# From scratch
+sbatch --export=seed=111,method=baseline,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=111,method=manipulation,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=111,method=swap,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=111,method=manip_swap,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=222,method=baseline,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=222,method=manipulation,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=222,method=swap,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=222,method=manip_swap,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=333,method=baseline,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=333,method=manipulation,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=333,method=swap,model=resnet18,use_pretrained=false run_baseline_cls.sh
+sbatch --export=seed=333,method=manip_swap,model=resnet18,use_pretrained=false run_baseline_cls.sh
+
+# Pretrained
+sbatch --export=seed=111,method=baseline,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=111,method=manipulation,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=111,method=swap,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=111,method=manip_swap,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=222,method=baseline,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=222,method=manipulation,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=222,method=swap,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=222,method=manip_swap,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=333,method=baseline,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=333,method=manipulation,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=333,method=swap,model=resnet18,use_pretrained=true run_baseline_cls.sh
+sbatch --export=seed=333,method=manip_swap,model=resnet18,use_pretrained=true run_baseline_cls.sh
+
+# Forced Split
+sbatch --export=seed=111,method=baseline,model=resnet18,use_pretrained=false run_baseline_split_cls.sh
+sbatch --export=seed=111,method=manipulation,model=resnet18,use_pretrained=false run_baseline_split_cls.sh
+sbatch --export=seed=111,method=swap,model=resnet18,use_pretrained=false run_baseline_split_cls.sh
+sbatch --export=seed=111,method=manip_swap,model=resnet18,use_pretrained=false run_baseline_split_cls.sh
+sbatch --export=seed=111,method=baseline,model=resnet18,use_pretrained=true run_baseline_split_cls.sh
+sbatch --export=seed=111,method=manipulation,model=resnet18,use_pretrained=true run_baseline_split_cls.sh
+sbatch --export=seed=111,method=swap,model=resnet18,use_pretrained=true run_baseline_split_cls.sh
+sbatch --export=seed=111,method=manip_swap,model=resnet18,use_pretrained=true run_baseline_split_cls.sh
+
+#MPI3d
+sbatch --export=model=resnet18,method=baseline,seed=111,use_pretrained=false run_baseline_mpi3d_cls.sh
+sbatch --export=model=resnet18,method=swap,seed=111,use_pretrained=false run_baseline_mpi3d_cls.sh
+sbatch --export=model=resnet18,method=baseline,seed=111,use_pretrained=true run_baseline_mpi3d_cls.sh
+sbatch --export=model=resnet18,method=swap,seed=111,use_pretrained=true run_baseline_mpi3d_cls.sh
+
+#dsprites
+sbatch --export=model=resnet18,method=baseline,seed=111,use_pretrained=false run_baseline_ds_cls.sh
+sbatch --export=model=resnet18,method=swap,seed=111,use_pretrained=false run_baseline_ds_cls.sh
+sbatch --export=model=resnet18,method=baseline,seed=111,use_pretrained=true run_baseline_ds_cls.sh
+sbatch --export=model=resnet18,method=swap,seed=111,use_pretrained=true run_baseline_ds_cls.sh
+#Shapes3d
+sbatch --export=model=resnet18,method=baseline,seed=111,use_pretrained=false run_baseline_s3d_cls.sh
+sbatch --export=model=resnet18,method=swap,seed=111,use_pretrained=false run_baseline_s3d_cls.sh
+sbatch --export=model=resnet18,method=baseline,seed=111,use_pretrained=true run_baseline_s3d_cls.sh
+sbatch --export=model=resnet18,method=swap,seed=111,use_pretrained=true run_baseline_s3d_cls.sh
