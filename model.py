@@ -1,207 +1,285 @@
 # model.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as tvm
-from typing import Dict, Sequence
 
 
-def make_encoder(name: str, z_dim: int, pretrained: bool = False):
+def make_encoder(name: str, pretrained: bool = False):
+    """
+    Devuelve (backbone_sin_fc, feat_dim).
+    """
     if name == "resnet18":
         m = tvm.resnet18(weights=tvm.ResNet18_Weights.DEFAULT if pretrained else None)
         feat_dim = m.fc.in_features
-        layers = list(m.children())[:-1]
-        encoder = nn.Sequential(*layers)
-    elif name == "resnet34":
+        backbone = nn.Sequential(*list(m.children())[:-1])  # -> [B, feat_dim, 1, 1]
+        return backbone, feat_dim
+    if name == "resnet34":
         m = tvm.resnet34(weights=tvm.ResNet34_Weights.DEFAULT if pretrained else None)
         feat_dim = m.fc.in_features
-        layers = list(m.children())[:-1]
-        encoder = nn.Sequential(*layers)
-    else:
-        raise ValueError(f"Encoder no soportado: {name}")
-    projector = nn.Linear(feat_dim, z_dim)
-    return encoder, projector, feat_dim
+        backbone = nn.Sequential(*list(m.children())[:-1])
+        return backbone, feat_dim
+    if name == "resnet50":
+        m = tvm.resnet50(weights=tvm.ResNet50_Weights.DEFAULT if pretrained else None)
+        feat_dim = m.fc.in_features
+        backbone = nn.Sequential(*list(m.children())[:-1])
+        return backbone, feat_dim
+    raise ValueError(f"Encoder no soportado: {name}")
 
 
-class HeadsNumbers(nn.Module):
+class HeadsFull(nn.Module):
     """
-    Heads para Numbers:
-      - Regresión: number (norm), scale, rot(sin/cos)
-      - Clasificación: number_logits, scale_logits, rot_logits, font_logits, color_logits
-    split_inv_eq:
-      - number usa z_inv
-      - resto usa z_eq
+    Produce dict outputs:
+      - factors:  {f"{name}_logits": [B,C]}
+      - numbers:  keys like number/number_logits, scale/scale_logits, rot_logits or rot_sin/rot_cos, font_logits, color_logits
+    Supports:
+      - cfg.factorwise_heads (split representation into equal chunks per factor/task)
+      - cfg.split_heads_inv_eq + cfg.inv_factors (old behavior)
     """
-    def __init__(
-        self,
-        z_dim: int,
-        num_classes: dict,
-        have_scale: bool,
-        have_rot: bool,
-        use_classification: bool = False,
-        split_inv_eq: bool = False,
-    ):
+
+    def __init__(self, cfg, have_scale: bool, have_rot: bool):
         super().__init__()
-        self.use_classification = use_classification
-        self.split_inv_eq = split_inv_eq
+        self.cfg = cfg
         self.have_scale = have_scale
         self.have_rot = have_rot
 
-        if self.split_inv_eq:
-            assert (z_dim % 2) == 0, "z_dim debe ser par para split inv/eq"
-            self.d_half = z_dim // 2
+        self.task_type = cfg.task_type
+        self.z_dim = int(cfg.z_dim)
+        self.factorwise = bool(getattr(cfg, "factorwise_heads", False))
+        self.split_inv_eq = bool(getattr(cfg, "split_heads_inv_eq", False))
+        self.inv_set = set(getattr(cfg, "inv_factors", []))
 
-        if not use_classification:
-            self.num = nn.Linear(z_dim, 1)
-            self.scale = nn.Linear(z_dim, 1) if have_scale else None
-            self.rot = nn.Linear(z_dim, 2) if have_rot else None
-        else:
-            n_num = int(num_classes.get("number", 5000))
-            n_scl = int(num_classes.get("scale", 6))
-            n_rot = int(num_classes.get("rotation", 8))
-            self.num = nn.Linear(z_dim, n_num)
-            self.scale = nn.Linear(z_dim, n_scl) if have_scale else None
-            self.rot = nn.Linear(z_dim, n_rot) if have_rot else None
+        if self.task_type == "factors":
+            self.factor_names: List[str] = list(getattr(cfg, "factor_names_order", []))
+            if len(self.factor_names) == 0:
+                # fallback (order not guaranteed)
+                self.factor_names = list(cfg.num_classes_for_classification.keys())
 
-        self.font = nn.Linear(z_dim, int(num_classes["font"])) if "font" in num_classes else None
-        self.color = nn.Linear(z_dim, int(num_classes["color"])) if "color" in num_classes else None
+            self.F = len(self.factor_names)
+            assert self.F > 0, "factor_names_order vacío; setéalo en train.py (cfg.factor_names_order = factor_names)."
 
-    def _make_task_views(self, z: torch.Tensor):
-        if not self.split_inv_eq:
-            return z, z
-        d = self.d_half
-        z_inv = z[:, :d]
-        z_eq = z[:, d:]
-        z_num = torch.cat([z_inv, torch.zeros_like(z_eq)], dim=1)
-        z_oth = torch.cat([torch.zeros_like(z_inv), z_eq], dim=1)
-        return z_num, z_oth
-
-    def forward(self, z: torch.Tensor):
-        out = {}
-        z_num, z_oth = self._make_task_views(z)
-
-        if not self.use_classification:
-            out["number"] = self.num(z_num).squeeze(-1)
-            if self.scale is not None:
-                out["scale"] = self.scale(z_oth).squeeze(-1)
-            if self.rot is not None:
-                r = self.rot(z_oth)
-                out["rot_sin"], out["rot_cos"] = r[:, 0], r[:, 1]
-        else:
-            out["number_logits"] = self.num(z_num)
-            if self.scale is not None:
-                out["scale_logits"] = self.scale(z_oth)
-            if self.rot is not None:
-                out["rot_logits"] = self.rot(z_oth)
-
-        if self.font is not None:
-            out["font_logits"] = self.font(z_oth)
-        if self.color is not None:
-            out["color_logits"] = self.color(z_oth)
-
-        return out
-
-
-class GenericHeads(nn.Module):
-    """
-    Un Linear por factor:
-      out[f"{name}_logits"] = [B, n_classes]
-    Opcional split inv/eq:
-      - factores en inv_factors usan z_inv
-      - el resto usa z_eq
-    """
-    def __init__(
-        self,
-        z_dim: int,
-        num_classes: Dict[str, int],
-        split_inv_eq: bool = False,
-        inv_factors: Sequence[str] = (),
-    ):
-        super().__init__()
-        self.num_classes = dict(num_classes)
-        self.split_inv_eq = bool(split_inv_eq)
-        self.inv_factors = set(inv_factors)
-
-        if self.split_inv_eq:
-            assert z_dim % 2 == 0, "z_dim debe ser par para split inv/eq"
-            self.d_half = z_dim // 2
-
-        self.heads = nn.ModuleDict({k: nn.Linear(z_dim, int(v)) for k, v in self.num_classes.items()})
-
-    def _views(self, z: torch.Tensor):
-        if not self.split_inv_eq:
-            return z, z
-        d = self.d_half
-        z_inv, z_eq = z[:, :d], z[:, d:]
-        z_inv_view = torch.cat([z_inv, torch.zeros_like(z_eq)], dim=1)
-        z_eq_view = torch.cat([torch.zeros_like(z_inv), z_eq], dim=1)
-        return z_inv_view, z_eq_view
-
-    def forward(self, z: torch.Tensor):
-        out = {}
-        z_inv_view, z_eq_view = self._views(z)
-        for name, head in self.heads.items():
-            if self.split_inv_eq:
-                z_use = z_inv_view if name in self.inv_factors else z_eq_view
+            if self.factorwise:
+                assert self.z_dim % self.F == 0, f"factorwise_heads requiere z_dim divisible por F={self.F}"
+                self.z_per = self.z_dim // self.F
             else:
-                z_use = z
-            out[f"{name}_logits"] = head(z_use)
+                self.z_per = None
+
+            if (not self.factorwise) and self.split_inv_eq:
+                assert self.z_dim % 2 == 0, "split_heads_inv_eq requiere z_dim par"
+                self.d_half = self.z_dim // 2
+            else:
+                self.d_half = None
+
+            self.heads = nn.ModuleDict()
+            for i, name in enumerate(self.factor_names):
+                ncls = int(cfg.num_classes_for_classification[name])
+                in_dim = self._in_dim_for_factor(i, name)
+                self.heads[name] = nn.Linear(in_dim, ncls)
+
+        else:
+            # numbers
+            # Define task chunks for factorwise split:
+            # rotation counts as one "task chunk" even if it outputs sin+cos
+            self.use_cls = bool(cfg.use_classification)
+            self.num_tasks_order: List[str] = []
+            if cfg.enable_number:
+                self.num_tasks_order.append("number")
+            if have_scale and cfg.enable_scale:
+                self.num_tasks_order.append("scale")
+            if have_rot and cfg.enable_rot:
+                self.num_tasks_order.append("rotation")
+            if cfg.enable_font and ("font" in cfg.num_classes_for_classification):
+                self.num_tasks_order.append("font")
+            if cfg.enable_color and ("color" in cfg.num_classes_for_classification):
+                self.num_tasks_order.append("color")
+
+            self.T = max(1, len(self.num_tasks_order))
+            if self.factorwise:
+                assert self.z_dim % self.T == 0, f"factorwise_heads en numbers requiere z_dim divisible por T={self.T}"
+                self.z_per_num = self.z_dim // self.T
+            else:
+                self.z_per_num = None
+
+            if (not self.factorwise) and self.split_inv_eq:
+                assert self.z_dim % 2 == 0, "split_heads_inv_eq requiere z_dim par"
+                self.d_half = self.z_dim // 2
+            else:
+                self.d_half = None
+
+            # build heads
+            self.number_head = None
+            self.number_logits = None
+            self.scale_head = None
+            self.scale_logits = None
+            self.rot_logits = None
+            self.rot_sin = None
+            self.rot_cos = None
+            self.font_logits = None
+            self.color_logits = None
+
+            # helper to get chunk for a named task
+            def in_dim_for_task(task: str) -> int:
+                if self.factorwise:
+                    return self.z_per_num
+                if self.split_inv_eq:
+                    # number uses inv half; others use eq half
+                    return self.d_half
+                return self.z_dim
+
+            # number
+            if cfg.enable_number:
+                if self.use_cls:
+                    self.number_logits = nn.Linear(in_dim_for_task("number"), int(cfg.num_classes_number))
+                else:
+                    self.number_head = nn.Linear(in_dim_for_task("number"), 1)
+
+            # scale
+            if have_scale and cfg.enable_scale:
+                if self.use_cls:
+                    self.scale_logits = nn.Linear(in_dim_for_task("scale"), int(cfg.num_classes_scale))
+                else:
+                    self.scale_head = nn.Linear(in_dim_for_task("scale"), 1)
+
+            # rotation
+            if have_rot and cfg.enable_rot:
+                if self.use_cls:
+                    self.rot_logits = nn.Linear(in_dim_for_task("rotation"), int(cfg.num_classes_rot))
+                else:
+                    self.rot_sin = nn.Linear(in_dim_for_task("rotation"), 1)
+                    self.rot_cos = nn.Linear(in_dim_for_task("rotation"), 1)
+
+            # font/color
+            if cfg.enable_font and ("font" in cfg.num_classes_for_classification):
+                self.font_logits = nn.Linear(in_dim_for_task("font"), int(cfg.num_classes_for_classification["font"]))
+            if cfg.enable_color and ("color" in cfg.num_classes_for_classification):
+                self.color_logits = nn.Linear(in_dim_for_task("color"), int(cfg.num_classes_for_classification["color"]))
+
+    def _slice_factorwise(self, z: torch.Tensor, idx: int) -> torch.Tensor:
+        a = idx * self.z_per
+        b = (idx + 1) * self.z_per
+        return z[:, a:b]
+
+    def _slice_num_task(self, z: torch.Tensor, task: str) -> torch.Tensor:
+        if self.factorwise:
+            idx = self.num_tasks_order.index(task)
+            a = idx * self.z_per_num
+            b = (idx + 1) * self.z_per_num
+            return z[:, a:b]
+        if self.split_inv_eq:
+            if task == "number":
+                return z[:, :self.d_half]
+            return z[:, self.d_half:]
+        return z
+
+    def _in_dim_for_factor(self, idx: int, name: str) -> int:
+        if self.factorwise:
+            return self.z_per
+        if self.split_inv_eq:
+            return self.z_dim // 2
+        return self.z_dim
+
+    def _slice_for_factor(self, z: torch.Tensor, idx: int, name: str) -> torch.Tensor:
+        if self.factorwise:
+            return self._slice_factorwise(z, idx)
+        if self.split_inv_eq:
+            d_half = self.z_dim // 2
+            if name in self.inv_set:
+                return z[:, :d_half]
+            return z[:, d_half:]
+        return z
+
+    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+
+        if self.task_type == "factors":
+            for i, name in enumerate(self.factor_names):
+                x = self._slice_for_factor(z, i, name)
+                out[f"{name}_logits"] = self.heads[name](x)
+            return out
+
+        # numbers
+        if self.number_logits is not None:
+            x = self._slice_num_task(z, "number")
+            out["number_logits"] = self.number_logits(x)
+        if self.number_head is not None:
+            x = self._slice_num_task(z, "number")
+            out["number"] = self.number_head(x).squeeze(1)
+
+        if self.scale_logits is not None:
+            x = self._slice_num_task(z, "scale")
+            out["scale_logits"] = self.scale_logits(x)
+        if self.scale_head is not None:
+            x = self._slice_num_task(z, "scale")
+            out["scale"] = self.scale_head(x).squeeze(1)
+
+        if self.rot_logits is not None:
+            x = self._slice_num_task(z, "rotation")
+            out["rot_logits"] = self.rot_logits(x)
+        if self.rot_sin is not None and self.rot_cos is not None:
+            x = self._slice_num_task(z, "rotation")
+            out["rot_sin"] = self.rot_sin(x).squeeze(1)
+            out["rot_cos"] = self.rot_cos(x).squeeze(1)
+
+        if self.font_logits is not None:
+            x = self._slice_num_task(z, "font")
+            out["font_logits"] = self.font_logits(x)
+        if self.color_logits is not None:
+            x = self._slice_num_task(z, "color")
+            out["color_logits"] = self.color_logits(x)
+
         return out
 
 
 class DNModel(nn.Module):
-    def __init__(self, cfg, have_scale: bool, have_rot: bool):
+    def __init__(self, cfg, have_scale: bool = False, have_rot: bool = False):
         super().__init__()
-        enc, proj, _ = make_encoder(cfg.encoder_name, cfg.z_dim, pretrained=cfg.use_pretrained_encoder)
-        self.encoder = enc
-        self.projector = proj
-        self.z_dim = cfg.z_dim
+        self.cfg = cfg
+        self.have_scale = have_scale
+        self.have_rot = have_rot
 
-        task_type = getattr(cfg, "task_type", "numbers")
+        backbone, feat_dim = make_encoder(cfg.encoder_name, pretrained=bool(cfg.use_pretrained_encoder))
+        self.backbone = backbone
+        self.projector = nn.Linear(feat_dim, int(cfg.z_dim))
 
-        if task_type == "factors":
-            self.heads_full = GenericHeads(
-                cfg.z_dim,
-                cfg.num_classes_for_classification,
-                split_inv_eq=getattr(cfg, "split_heads_inv_eq", False),
-                inv_factors=getattr(cfg, "inv_factors", []),
-            )
-        else:
-            self.heads_full = HeadsNumbers(
-                cfg.z_dim,
-                cfg.num_classes_for_classification,
-                have_scale,
-                have_rot,
-                use_classification=cfg.use_classification,
-                split_inv_eq=getattr(cfg, "split_heads_inv_eq", False),
-            )
+        self.heads_full = HeadsFull(cfg, have_scale=have_scale, have_rot=have_rot)
 
-    def encode(self, x):
-        f = self.encoder(x)
-        f = torch.flatten(f, 1)
-        z = self.projector(f)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        # ensure 3-channel for resnet
+        if x.ndim == 4 and x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)
+        h = self.backbone(x)                 # [B, feat_dim, 1, 1]
+        h = h.flatten(1)                     # [B, feat_dim]
+        z = self.projector(h)                # [B, z_dim]
         return z
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         z = self.encode(x)
-        return {"z_full": z, **self.heads_full(z)}
+        return self.heads_full(z)
 
 
 class Manipulator(nn.Module):
-    def __init__(self, z_dim: int, ctrl_dim: int = 5, hidden: int = 2048):
+    """
+    Simple manipulator: z_hat = z + MLP([z, ctrl])
+    """
+    def __init__(self, z_dim: int, ctrl_dim: int, hidden: int = 512):
         super().__init__()
-        self.ctrl_embed = nn.Sequential(
-            nn.Linear(ctrl_dim, 128),
-            nn.ReLU(True),
-            nn.Linear(128, 128),
-            nn.ReLU(True),
-        )
+        self.z_dim = int(z_dim)
+        self.ctrl_dim = int(ctrl_dim)
+
         self.net = nn.Sequential(
-            nn.Linear(z_dim + 128, hidden),
-            nn.ReLU(True),
-            nn.Linear(hidden, z_dim),
+            nn.Linear(self.z_dim + self.ctrl_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, self.z_dim),
         )
 
-    def forward(self, z, ctrl):
-        e = self.ctrl_embed(ctrl)
-        h = torch.cat([z, e], dim=1)
-        return z + self.net(h)
+    def forward(self, z: torch.Tensor, ctrl: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([z, ctrl], dim=1)
+        dz = self.net(x)
+        return z + dz

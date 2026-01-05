@@ -36,8 +36,10 @@ from model import DNModel, Manipulator
 class TrainConfig:
     # dataset selector
     dataset: str = "numbers"  # numbers | dsprites | idsprites | shapes3d | mpi3d
+
     # Numbers (.pt)
     pt_path: str = "../datasets/exports/train_64x64.pt"
+
     # IDG (.npz)
     idg_root: str = "../datasets"
     idg_split: str = "composition"  # random|composition|interpolation|extrapolation
@@ -56,7 +58,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     device: str = "cuda"
 
-    train_mode: str = "manip_swap"  # baseline | manipulation | swap | manip_swap
+    train_mode: str = "manip_swap"  # baseline | manipulation | swap | manip_swap | full_swap
 
     # architecture
     encoder_name: str = "resnet18"
@@ -64,8 +66,22 @@ class TrainConfig:
     use_pretrained_encoder: bool = False
 
     # heads behavior
-    split_heads_inv_eq: bool = False  # for swap/manip_swap we force True
-    inv_factors: List[str] = field(default_factory=list)  # for IDG: which factors are "inv"
+    split_heads_inv_eq: bool = False  # old: split rep into inv/eq halves for heads
+    inv_factors: List[str] = field(default_factory=list)  # for IDG swap modes: which factors are "inv"
+
+    # NEW: factorwise heads ("split" flag)
+    factorwise_heads: bool = False  # split z evenly per factor/task and feed each head its chunk
+
+    # factor order for IDG (set at runtime)
+    factor_names_order: List[str] = field(default_factory=list)
+
+    # NEW: full_swap params (IDG only)
+    full_swap_p: float = 0.5                 # prob swap per factor in each sampled pair
+    full_swap_force_nonempty: bool = True    # force at least 1 factor swapped for i!=j
+    full_swap_exclude_diag: bool = True      # exclude i==j from pair sampling
+    full_swap_max_pairs: int = 0             # 0 => all pairs; else subsample up to this many
+    pair_weight: float = 1.0
+    aux_weight: float = 1.0
 
     # classification/regression (numbers)
     use_classification: bool = False
@@ -106,14 +122,24 @@ def parse_args_to_cfg() -> TrainConfig:
     p = argparse.ArgumentParser("train.py (Numbers + IDG npz)")
 
     # dataset choice
-    p.add_argument("--dataset", type=str, choices=["numbers", "dsprites", "idsprites", "shapes3d", "mpi3d"], default=TrainConfig.dataset)
+    p.add_argument(
+        "--dataset",
+        type=str,
+        choices=["numbers", "dsprites", "idsprites", "shapes3d", "mpi3d"],
+        default=TrainConfig.dataset,
+    )
 
     # numbers
     p.add_argument("--pt_path", type=str, default=TrainConfig.pt_path)
 
     # idg
     p.add_argument("--idg_root", type=str, default=TrainConfig.idg_root)
-    p.add_argument("--idg_split", type=str, choices=["random", "composition", "interpolation", "extrapolation"], default=TrainConfig.idg_split)
+    p.add_argument(
+        "--idg_split",
+        type=str,
+        choices=["random", "composition", "interpolation", "extrapolation"],
+        default=TrainConfig.idg_split,
+    )
     p.add_argument("--inv_factors", type=str, default=None, help="CSV: e.g. shape,object_hue (IDG only)")
 
     # training / io
@@ -126,7 +152,12 @@ def parse_args_to_cfg() -> TrainConfig:
     p.add_argument("--z_dim", type=int, default=TrainConfig.z_dim)
     p.add_argument("--use_pretrained_encoder", action="store_true")
 
-    p.add_argument("--train_mode", type=str, choices=["baseline", "manipulation", "swap", "manip_swap"], default=TrainConfig.train_mode)
+    p.add_argument(
+        "--train_mode",
+        type=str,
+        choices=["baseline", "manipulation", "swap", "manip_swap", "full_swap"],
+        default=TrainConfig.train_mode,
+    )
     p.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     p.add_argument("--batch_size", type=int, default=TrainConfig.batch_size)
     p.add_argument("--num_workers", type=int, default=TrainConfig.num_workers)
@@ -137,6 +168,17 @@ def parse_args_to_cfg() -> TrainConfig:
     p.add_argument("--seed", type=int, default=TrainConfig.seed)
 
     p.add_argument("--split_heads_inv_eq", action="store_true")
+
+    # NEW: factorwise heads
+    p.add_argument("--factorwise_heads", action="store_true")
+
+    # NEW: full_swap params
+    p.add_argument("--full_swap_p", type=float, default=TrainConfig.full_swap_p)
+    p.add_argument("--no_full_swap_force_nonempty", dest="full_swap_force_nonempty", action="store_false")
+    p.add_argument("--no_full_swap_exclude_diag", dest="full_swap_exclude_diag", action="store_false")
+    p.add_argument("--full_swap_max_pairs", type=int, default=TrainConfig.full_swap_max_pairs)
+    p.add_argument("--pair_weight", type=float, default=TrainConfig.pair_weight)
+    p.add_argument("--aux_weight", type=float, default=TrainConfig.aux_weight)
 
     # numbers toggles
     p.add_argument("--use_classification", action="store_true")
@@ -314,7 +356,6 @@ class LossComputerNumbers:
                 lr_cos = F.mse_loss(preds["rot_cos"], targets["rot_cos"])
                 lr = lr_sin + lr_cos
                 loss = loss + lr
-                # accuracy discretizada
                 pred_rad = torch.atan2(preds["rot_sin"].detach(), preds["rot_cos"].detach())
                 pred_deg = torch.remainder(pred_rad * (180.0 / math.pi), 360.0)
                 tgt_deg = torch.remainder(targets["rotation_deg"], 360.0)
@@ -457,6 +498,28 @@ def run_epoch_baseline(model, losscomp, loader, cfg: TrainConfig, epoch, optimiz
     return {k: float(sum(d[k] for d in agg) / len(agg)) for k in keys}
 
 
+def run_epoch_eval_plain(model, losscomp, loader, cfg: TrainConfig, epoch, header="Eval"):
+    model.eval()
+    agg = []
+
+    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Ep {epoch} {header}")
+    with torch.no_grad():
+        for it, batch in pbar:
+            batch, _ = normalize_batch_to_dict(batch)
+            batch = to_device_batch(batch, cfg.device)
+
+            imgs = batch["image"]
+            outs = model(imgs)
+
+            targets = losscomp.targets_from_batch(batch)
+            loss, metr = losscomp.compute(outs, targets)
+
+            agg.append(metr)
+
+    keys = agg[0].keys()
+    return {k: float(sum(d[k] for d in agg) / len(agg)) for k in keys}
+
+
 def run_epoch_swap(model, losscomp, loader, cfg: TrainConfig, epoch, optimizer=None, factor_names: Optional[List[str]] = None):
     is_train = optimizer is not None
     model.train(is_train)
@@ -478,7 +541,7 @@ def run_epoch_swap(model, losscomp, loader, cfg: TrainConfig, epoch, optimizer=N
         g.manual_seed(cfg.pair_seed + it)
         perm = torch.randperm(B, generator=g, device=imgs.device)
 
-        imgs_j = imgs[perm] # if is_train else imgs
+        imgs_j = imgs[perm]
 
         yi = losscomp.targets_from_batch(batch)
 
@@ -526,7 +589,6 @@ def run_epoch_swap(model, losscomp, loader, cfg: TrainConfig, epoch, optimizer=N
         agg.append(metr)
 
         if is_train and it % cfg.print_freq == 0 and it > 0:
-            # para swap, imprime las i_* (si existen)
             compact = {"loss": metr["loss"]}
             for k, v in metr.items():
                 if k.startswith("i_acc_") or k.startswith("i_mae_") or k.startswith("i_acc"):
@@ -536,26 +598,137 @@ def run_epoch_swap(model, losscomp, loader, cfg: TrainConfig, epoch, optimizer=N
     keys = agg[0].keys()
     return {k: float(sum(d[k] for d in agg) / len(agg)) for k in keys}
 
-def run_epoch_eval_plain(model, losscomp, loader, cfg: TrainConfig, epoch, header="Eval"):
-    model.eval()
+
+def run_epoch_full_swap(model, losscomp, loader, cfg: TrainConfig, epoch, optimizer=None, factor_names: Optional[List[str]] = None):
+    """
+    FULL_SWAP (IDG/factors only):
+      - requiere factorwise_heads=True
+      - samplea pares (i,j) del batch (todos si full_swap_max_pairs=0)
+      - para cada par, samplea subconjunto de factores a swapear
+      - mezcla z por chunks de factor y supervisa targets mezclados
+      - preserva aux loss en ejemplos originales
+    """
+    is_train = optimizer is not None
+    model.train(is_train)
     agg = []
 
-    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Ep {epoch} {header}")
-    with torch.no_grad():
-        for it, batch in pbar:
-            batch, _ = normalize_batch_to_dict(batch)
-            batch = to_device_batch(batch, cfg.device)
+    assert cfg.task_type == "factors", "full_swap está implementado para IDG (factors)."
+    assert factor_names is not None
+    assert cfg.factorwise_heads, "full_swap asume que z está partitioned por factor (factorwise_heads=True)."
 
-            imgs = batch["image"]
-            outs = model(imgs)  # forward normal: heads_full(encode(x))
+    F = len(factor_names)
+    assert cfg.z_dim % F == 0, f"z_dim={cfg.z_dim} debe ser divisible por #factores={F}"
+    z_per = cfg.z_dim // F
 
-            targets = losscomp.targets_from_batch(batch)
-            loss, metr = losscomp.compute(outs, targets)
+    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Ep {epoch} FullSwap {'Train' if is_train else 'Val'}")
+    for it, batch in pbar:
+        batch, _ = normalize_batch_to_dict(batch)
+        batch = to_device_batch(batch, cfg.device)
 
-            agg.append(metr)
+        imgs = batch["image"]
+        B = imgs.size(0)
+
+        yi = losscomp.targets_from_batch(batch)  # dict factor-> [B]
+
+        # encode once
+        z = model.encode(imgs)  # [B, D]
+
+        # aux on originals
+        preds_aux = model.heads_full(z)
+        loss_aux, metr_aux = losscomp.compute(preds_aux, yi)
+
+        # build pair indices
+        g = torch.Generator(device=imgs.device)
+        g.manual_seed(cfg.pair_seed + it)
+
+        exclude_diag = bool(cfg.full_swap_exclude_diag)
+        total_pairs = B * B - (B if exclude_diag else 0)
+
+        max_pairs = int(cfg.full_swap_max_pairs)
+        if max_pairs <= 0 or max_pairs >= total_pairs:
+            # all pairs
+            ii = torch.arange(B, device=imgs.device).repeat_interleave(B)
+            jj = torch.arange(B, device=imgs.device).repeat(B)
+            if exclude_diag:
+                keep = (ii != jj)
+                ii = ii[keep]
+                jj = jj[keep]
+        else:
+            P = max_pairs
+            ii = torch.randint(0, B, (P,), generator=g, device=imgs.device)
+            jj = torch.randint(0, B, (P,), generator=g, device=imgs.device)
+            if exclude_diag:
+                # resample clashes a few times (good enough)
+                for _ in range(5):
+                    bad = (ii == jj)
+                    if not bad.any():
+                        break
+                    jj[bad] = torch.randint(0, B, (int(bad.sum().item()),), generator=g, device=imgs.device)
+
+        P = ii.numel()
+        z_i = z[ii].clone()   # [P, D]
+        z_j = z[jj]           # [P, D]
+
+        # mask [P, F]
+        mask = (torch.rand((P, F), generator=g, device=imgs.device) < float(cfg.full_swap_p))
+
+        if cfg.full_swap_force_nonempty and P > 0:
+            # force at least one swapped factor (for i!=j; if exclude_diag=True, always i!=j)
+            empty = (mask.sum(dim=1) == 0)
+            if empty.any():
+                ridx = torch.nonzero(empty).squeeze(1)
+                fidx = torch.randint(0, F, (ridx.numel(),), generator=g, device=imgs.device)
+                mask[ridx, fidx] = True
+
+        # apply swaps per factor chunk
+        for fi in range(F):
+            a = fi * z_per
+            b = (fi + 1) * z_per
+            m = mask[:, fi].unsqueeze(1)  # [P,1]
+            z_i[:, a:b] = torch.where(m, z_j[:, a:b], z_i[:, a:b])
+
+        preds_pairs = model.heads_full(z_i)
+
+        # mixed targets per factor
+        tgt_pairs = {}
+        for fi, name in enumerate(factor_names):
+            yi_f = yi[name][ii]  # [P]
+            yj_f = yi[name][jj]  # [P]  (same source dict; just index j)
+            tgt_pairs[name] = torch.where(mask[:, fi], yj_f, yi_f)
+
+        loss_pairs, metr_pairs = losscomp.compute(preds_pairs, tgt_pairs)
+
+        loss = float(cfg.pair_weight) * loss_pairs + float(cfg.aux_weight) * loss_aux
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        metr = {
+            "loss": float(loss.item()),
+            "loss_pairs": float(loss_pairs.item()),
+            "loss_aux": float(loss_aux.item()),
+        }
+        for k, v in metr_pairs.items():
+            if k.startswith("acc_") or k == "acc_mean":
+                metr[f"pair_{k}"] = float(v)
+        for k, v in metr_aux.items():
+            if k.startswith("acc_") or k == "acc_mean":
+                metr[f"aux_{k}"] = float(v)
+
+        agg.append(metr)
+
+        if is_train and it % cfg.print_freq == 0 and it > 0:
+            compact = {"loss": metr["loss"]}
+            # muestra algunos accs
+            for k in sorted([k for k in metr.keys() if k.startswith("pair_acc_")])[:8]:
+                compact[k] = metr[k]
+            log_batch_metrics(epoch, it, compact, "FullSwap")
 
     keys = agg[0].keys()
     return {k: float(sum(d[k] for d in agg) / len(agg)) for k in keys}
+
 
 def run_epoch_manip(model, manip, losscomp, loader, cfg: TrainConfig, epoch, optimizer=None,
                    factor_names: Optional[List[str]] = None, num_classes: Optional[Dict[str, int]] = None):
@@ -671,8 +844,8 @@ def run_epoch_manip_swap(model, manip, losscomp, loader, cfg: TrainConfig, epoch
         z_inv_i_hat, z_eq_i_hat = z_i_hat[:, :d_half], z_i_hat[:, d_half:]
         z_inv_j_hat, z_eq_j_hat = z_j_hat[:, :d_half], z_j_hat[:, d_half:]
 
-        z_final_i = torch.cat([z_inv_j_hat, z_eq_i_hat], dim=1)  # inv from j, eq from i
-        z_final_j = torch.cat([z_inv_i_hat, z_eq_j_hat], dim=1)  # inv from i, eq from j
+        z_final_i = torch.cat([z_inv_j_hat, z_eq_i_hat], dim=1)
+        z_final_j = torch.cat([z_inv_i_hat, z_eq_j_hat], dim=1)
 
         preds_i = model.heads_full(z_final_i)
         preds_j = model.heads_full(z_final_j)
@@ -716,7 +889,7 @@ def run_epoch_manip_swap(model, manip, losscomp, loader, cfg: TrainConfig, epoch
 def run_one_split(model, manip, losscomp, loader, cfg: TrainConfig, epoch, optimizer,
                   factor_names=None, num_classes=None, split_name="train"):
 
-    # ✅ EVALUACIÓN: nunca uses swap/manip; mide desempeño natural
+    # ✅ EVALUACIÓN: nunca uses swap/manip/full_swap; mide desempeño natural
     if optimizer is None:
         return run_epoch_eval_plain(model, losscomp, loader, cfg, epoch, header=split_name)
 
@@ -731,6 +904,9 @@ def run_one_split(model, manip, losscomp, loader, cfg: TrainConfig, epoch, optim
     if cfg.train_mode == "manip_swap":
         return run_epoch_manip_swap(model, manip, losscomp, loader, cfg, epoch, optimizer,
                                     factor_names=factor_names, num_classes=num_classes)
+    if cfg.train_mode == "full_swap":
+        return run_epoch_full_swap(model, losscomp, loader, cfg, epoch, optimizer, factor_names=factor_names)
+
     raise ValueError(f"train_mode desconocido: {cfg.train_mode}")
 
 
@@ -762,10 +938,8 @@ def load_checkpoint_with_fallback(checkpoint_path: str, device: str, ckpt_dir: O
             return ckpt, str(cur)
         except Exception as e:
             print(f"⚠️ Falló {cur.name}: {e}")
-            # si no hay fallback, salir
             if ckpt_dir is None or cur.parent.resolve() != ckpt_dir.resolve():
                 break
-            # buscar otro ckpt
             cands = [p for p in ckpt_dir.glob("ckpt_ep*.pt") if p.exists() and p not in tried]
             if not cands:
                 break
@@ -783,10 +957,15 @@ def main():
     cfg = parse_args_to_cfg()
     set_global_seeds(cfg.seed, cfg.device)
 
-    # force split_heads_inv_eq for swap modes (recommended)
-    if cfg.train_mode in ("swap", "manip_swap") and not cfg.split_heads_inv_eq:
-        print("⚠️ Forzando split_heads_inv_eq=True porque train_mode usa swap.")
+    # force split_heads_inv_eq for swap modes (recommended) unless you're using factorwise heads
+    if cfg.train_mode in ("swap", "manip_swap") and (not cfg.factorwise_heads) and (not cfg.split_heads_inv_eq):
+        print("⚠️ Forzando split_heads_inv_eq=True porque train_mode usa swap (y no estás en factorwise_heads).")
         cfg.split_heads_inv_eq = True
+
+    # sanity: full_swap implies factorwise heads + factors task (we'll assert later once factor_names exist)
+    if cfg.train_mode == "full_swap" and not cfg.factorwise_heads:
+        print("⚠️ full_swap requiere --factorwise_heads. Activándolo.")
+        cfg.factorwise_heads = True
 
     # dirs
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -844,6 +1023,9 @@ def main():
 
         losscomp = LossComputerNumbers(cfg, y_max=meta["y_max"], have_scale=have_scale, have_rot=have_rot)
 
+        if cfg.train_mode == "full_swap":
+            raise ValueError("full_swap está pensado para IDG/factors (dsprites/shapes3d/mpi3d).")
+
     else:
         # IDG datasets
         cfg.task_type = "factors"
@@ -868,18 +1050,22 @@ def main():
         dls = make_idg_dataloaders(idg_cfg, build=("train", "val", "test"))
         train_dl, val_dl, test_dl = dls["train"], dls["val"], dls["test"]
 
-        # dataset base (antes del split) para nombres/cardinalidades
         base_train: IDGBenchmarkDataset = train_dl.dataset.dataset
         factor_names = list(base_train.factor_names)
         num_classes = infer_num_classes_from_idg(base_train)
 
         cfg.num_classes_for_classification = dict(num_classes)
+        cfg.factor_names_order = list(factor_names)  # IMPORTANT for factorwise slicing in model
 
         if cfg.split_heads_inv_eq and len(cfg.inv_factors) == 0:
-            # default razonable
             default_inv = "shape" if cfg.dataset == "shapes3d" else ("object_shape" if cfg.dataset == "mpi3d" else factor_names[0])
             cfg.inv_factors = [default_inv]
             print(f"⚠️ split_heads_inv_eq=True y inv_factors vacío -> usando {cfg.inv_factors}")
+
+        if cfg.train_mode == "full_swap":
+            # full_swap requires z_dim divisible by F (we assert in epoch runner too)
+            if cfg.z_dim % len(factor_names) != 0:
+                raise ValueError(f"full_swap requiere z_dim divisible por #factores: z_dim={cfg.z_dim}, F={len(factor_names)}")
 
         losscomp = LossComputerFactors(factor_names)
 
@@ -928,7 +1114,6 @@ def main():
         with open(csv_path, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "split", "metric", "value"])
     else:
-        # truncate >= start_epoch
         rows = []
         with open(csv_path, "r", newline="") as f:
             r = csv.reader(f)
@@ -956,7 +1141,7 @@ def main():
         t0 = time.time()
 
         tr = run_one_split(model, manip, losscomp, train_dl, cfg, ep, optimizer,
-                           factor_names=factor_names, num_classes=num_classes)
+                           factor_names=factor_names, num_classes=num_classes, split_name="train")
         with torch.no_grad():
             va = run_one_split(model, manip, losscomp, val_dl, cfg, ep, None,
                                factor_names=factor_names, num_classes=num_classes, split_name="val")
@@ -980,15 +1165,16 @@ def main():
             torch.save(save, ckpt_path)
             print(f"💾 Saved: {ckpt_path.name}")
 
-        # optional: evaluate IDG test at end
+        # evaluate IDG test (plain eval) each epoch if available
         if test_dl is not None:
             with torch.no_grad():
                 te = run_one_split(model, manip, losscomp, test_dl, cfg, ep, None,
-                                   factor_names=factor_names, num_classes=num_classes, 
-                                   split_name="test")
+                                   factor_names=factor_names, num_classes=num_classes, split_name="test")
             log_metrics(ep, "test", te)
-            print(f"🧪 TEST | loss={te.get('loss'):.4f} | acc_mean={te.get('acc_mean', float('nan')):.4f}")
-
+            if "acc_mean" in te:
+                print(f"🧪 TEST | loss={te.get('loss'):.4f} | acc_mean={te.get('acc_mean', float('nan')):.4f}")
+            else:
+                print(f"🧪 TEST | loss={te.get('loss'):.4f}")
 
 if __name__ == "__main__":
     main()
